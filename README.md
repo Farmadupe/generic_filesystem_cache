@@ -2,7 +2,7 @@
 
 A small rust library for caching slow-to-compute data based on hard drive contents. Given a set of starting paths and a 'processing function' supplied by you, this library will recursively scan the filesystem from those starting paths and apply the processing function to each file.
 
-The cache will periodically save cached data to disk at a path given by you.
+The cache will save cached data to disk at a path given by you whenever a set number of changes has occurred inside the cache.
 
 When directed by you, the cache will update itself if the 'modification time' of any cached file is changed.
 
