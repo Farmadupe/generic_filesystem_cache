@@ -2,44 +2,46 @@ use std::{
     borrow::Borrow,
     fs,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use rayon::prelude::*;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use FsCacheErrorKind::*;
 
 use super::{
     base_fs_cache::BaseFsCache,
     errors::{FsCacheErrorKind, FsCacheResult},
 };
-use crate::file_set::FileSet;
+use crate::cache_interface::CacheInterface;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// How a file on disk may have changed since the last time the cache was updated
+enum UpdateAction {
+    NoChange,
+    Update(SystemTime),
+    Remove,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct MtimeCacheEntry<T> {
     cache_mtime: SystemTime,
     value: T,
 }
 
-pub struct ProcessingFsCache<T> {
-    base_cache: BaseFsCache<MtimeCacheEntry<T>>,
-    processing_fn: Box<dyn Fn(PathBuf) -> T + Send + Sync>,
+pub struct ProcessingFsCache<I>
+where
+    I: CacheInterface,
+{
+    base_cache: BaseFsCache<MtimeCacheEntry<I::T>>,
+    interface: I,
 }
 
-impl<T> ProcessingFsCache<T>
+impl<I> ProcessingFsCache<I>
 where
-    T: DeserializeOwned + Serialize + Send + Sync + Clone,
+    I: CacheInterface + Send + Sync,
 {
-    pub fn new(
-        cache_save_threshold: u32,
-        cache_path: PathBuf,
-        processing_fn: Box<dyn Fn(PathBuf) -> T + Send + Sync>,
-    ) -> FsCacheResult<Self> {
+    pub fn new(cache_save_threshold: u32, cache_path: PathBuf, interface: I) -> FsCacheResult<Self> {
         match BaseFsCache::new(cache_save_threshold, cache_path) {
-            Ok(base_cache) => Ok(Self {
-                base_cache,
-                processing_fn,
-            }),
+            Ok(base_cache) => Ok(Self { base_cache, interface }),
             Err(e) => Err(e),
         }
     }
@@ -48,99 +50,53 @@ where
         self.base_cache.save()
     }
 
-    fn force_insert(&self, key: impl Borrow<PathBuf>, mtime: SystemTime) -> FsCacheResult<T> {
+    pub fn remove(&self, key: impl AsRef<Path>) -> FsCacheResult<()> {
+        self.base_cache.remove(key)
+    }
+
+    pub fn fetch(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<I::T> {
+        match self.base_cache.fetch(key.borrow()) {
+            Ok(MtimeCacheEntry { cache_mtime: _, value }) => Ok(value),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn fetch_update(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<Option<I::T>> {
+        //insertion required if:
+        // * Item is not in cache.
+        // * Cached item is out of date.
+
+        match self.get_update_action(key.borrow())? {
+            UpdateAction::NoChange => self.fetch(key).map(Option::from),
+            UpdateAction::Update(fs_mtime) => self.force_update_inner(key, fs_mtime).map(Option::from),
+            UpdateAction::Remove => self.remove(key.borrow().as_path()).map(|_| None),
+        }
+    }
+
+    pub fn force_update(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<I::T> {
+        self.force_update_inner(
+            key.borrow(),
+            Self::fs_mtime(key.borrow()).map_err(|e| FsCacheErrorKind::CacheFileIo {
+                path: key.borrow().to_path_buf(),
+                src: e,
+            })?,
+        )
+    }
+
+    fn force_update_inner(&self, key: impl Borrow<PathBuf>, mtime: SystemTime) -> FsCacheResult<I::T> {
         let k = key.borrow().clone();
 
-        let value = (self.processing_fn)(k.clone());
+        let value = self.interface.load(k.clone());
         let cache_entry = MtimeCacheEntry {
             cache_mtime: mtime,
             value,
         };
         self.base_cache.insert(k, cache_entry)?;
 
-        self.get(key)
+        self.fetch(key)
     }
 
-    pub fn remove(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<()> {
-        info!(target: "generic_cache", "Removing item {:?}, {}", key.borrow(), self.keys().len());
-        self.base_cache.remove(key)
-    }
-
-    pub fn get(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<T> {
-        match self.base_cache.get(key.borrow()) {
-            Ok(MtimeCacheEntry {
-                cache_mtime: _,
-                value,
-            }) => Ok(value),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn get_mtime(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<SystemTime> {
-        let key = key.borrow();
-        let metadata = match fs::metadata(&key) {
-            Ok(metadata) => metadata,
-            Err(e) => {
-                return Err(CacheItemIoError {
-                    src: format!("{}", e),
-                    path: key.clone(),
-                })
-            }
-        };
-
-        let fs_mtime = match metadata.modified() {
-            Ok(fs_mtime) => fs_mtime,
-            Err(e) => {
-                return Err(CacheItemIoError {
-                    src: format!("{}", e),
-                    path: key.clone(),
-                })
-            }
-        };
-
-        Ok(fs_mtime)
-    }
-
-    pub fn get_insert(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<T> {
-        let val_is_stale = |key: &Path| -> FsCacheResult<(bool, SystemTime)> {
-            let cache_mtime = self.base_cache.get(key.to_path_buf())?.cache_mtime;
-            let fs_mtime = self.get_mtime(key.to_path_buf())?;
-
-            let is_stale = fs_mtime != cache_mtime;
-
-            Ok((is_stale, fs_mtime))
-        };
-
-        //insertion required if:
-        // * Item is not in cache.
-        // * Cached item is out of date.
-        let mut insert_required = !self.contains_key(key.borrow());
-
-        let mut fs_mtime: Option<SystemTime> = None;
-
-        if !insert_required {
-            let x = val_is_stale(key.borrow())?;
-            insert_required = x.0;
-            fs_mtime = Some(x.1);
-        }
-
-        if insert_required {
-            let fs_mtime = match fs_mtime {
-                Some(fs_mtime) => fs_mtime,
-                None => self.get_mtime(key.borrow())?,
-            };
-
-            self.force_insert(key.borrow(), fs_mtime)?;
-        }
-
-        self.get(key)
-    }
-
-    pub fn force_reload(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<T> {
-        self.force_insert(key.borrow(), self.get_mtime(key.borrow())?)
-    }
-
-    pub fn contains_key(&self, key: impl Borrow<PathBuf>) -> bool {
+    pub fn contains_key(&self, key: &Path) -> bool {
         self.base_cache.contains_key(key)
     }
 
@@ -152,35 +108,62 @@ where
         self.base_cache.len()
     }
 
-    pub fn update_from_fs(
-        &self,
-        filename_enumerator: &mut FileSet,
-    ) -> Result<Vec<FsCacheErrorKind>, FsCacheErrorKind> {
-        let mut errs_ret = vec![];
+    pub fn is_empty(&self) -> bool {
+        self.base_cache.is_empty()
+    }
 
-        //First add items which are new or changed in the filesystem.
-        let loading_paths = {
-            let (loading_paths, errs) = filename_enumerator.enumerate_from_fs()?;
-            errs_ret.extend(errs.into_iter().map(FsCacheErrorKind::from));
-            loading_paths.to_owned()
+    fn fs_mtime(key: &Path) -> Result<SystemTime, std::io::Error> {
+        fs::metadata(&key)?.modified()
+    }
+
+    // helper function to get whether a particular path has been updated in the filesystem.
+    // Contains a hacky workaround for a problem where SSHFS (and presumably FUSE underneath)
+    // reports different mtimes for files compared to a backing BTRFS filesystem (FUSE/sshfs probably
+    // reports less granular mtimes?), where a file will only be considered stale if the mtime
+    // is different by more than DURATION_TOLERANCE.
+    fn get_update_action(&self, key: &Path) -> FsCacheResult<UpdateAction> {
+        // debug: switch between ignoring nanos and not (current  workaround for nanos-difference might be causing issues?)
+        let include_nanos = false;
+
+        //If the path is not present on the filesystem, then remove it from the cache
+        //(it may have never existed in the cache but this is OK)
+        let fs_mtime = match Self::fs_mtime(key) {
+            Ok(fs_mtime) => fs_mtime,
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::NotFound => return Ok(UpdateAction::Remove),
+                _ => {
+                    return Err(CacheFileIo {
+                        path: key.to_path_buf(),
+                        src: e,
+                    })
+                }
+            },
         };
 
-        //Now delete those items which have disappeared from the filesystem..
-        for key in &self.keys() {
-            if filename_enumerator.includes(key) && !key.exists() {
-                self.remove(key)?;
-            }
+        //if the file exists on the filesystem but not in the cache, we will insert it.
+        let cache_mtime = match self.base_cache.fetch(key) {
+            Ok(entry) => entry.cache_mtime,
+            Err(_e) => return Ok(UpdateAction::Update(fs_mtime)),
+        };
+
+        //otherwise, see if the file is changed...
+        let is_stale = if include_nanos {
+            //original implementation used the following code, which produced errors as SystemTime::duration_since
+            //appears to return an error if only the nanos portion of the fields differ
+            fs_mtime != cache_mtime
+        } else {
+            // To fix the problem the durations are converted seconds since unix epoch.
+            const DURATION_TOLERANCE_SECS: i64 = 2;
+            let cache_mtime_secs = cache_mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            let fs_mtime_secs = fs_mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+
+            (cache_mtime_secs - fs_mtime_secs).abs() > DURATION_TOLERANCE_SECS
+        };
+
+        if is_stale {
+            Ok(UpdateAction::Update(fs_mtime))
+        } else {
+            Ok(UpdateAction::NoChange)
         }
-
-        let errs: Vec<_> = loading_paths
-            .into_par_iter()
-            .map(|path| self.get_insert(path.borrow()))
-            .filter_map(Result::err)
-            .collect();
-        errs_ret.extend(errs);
-
-        self.save()?;
-
-        Ok(errs_ret)
     }
 }

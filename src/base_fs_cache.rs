@@ -1,13 +1,14 @@
 use std::{
-    borrow::Borrow,
     fmt::Debug,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering::Relaxed},
         RwLock,
     },
 };
 
+use log::info;
+use log::trace;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::errors::{
@@ -15,6 +16,7 @@ use crate::errors::{
     FsCacheResult,
 };
 
+//Types defining the on-disk format of the filesystem cacher.
 type CacheDiskFormat<T> = std::collections::HashMap<PathBuf, T>;
 
 #[derive(Default, Debug)]
@@ -62,8 +64,8 @@ where
         if !&self.cache_path.exists() {
             if let Some(ref parent_dir) = self.cache_path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent_dir) {
-                    return Err(CacheFileIoError {
-                        src: format!("{}", e),
+                    return Err(CacheFileIo {
+                        src: e,
                         path: self.cache_path.clone(),
                     });
                 }
@@ -76,7 +78,7 @@ where
         let temp_store_path = self.cache_path.with_extension("tmp");
 
         info!(
-            target: "cache_changes",
+            target: "generic_cache_transactions",
             "saving updated cache at {} of size {}",
 
             self.cache_path.display(),
@@ -86,15 +88,15 @@ where
             }
         );
 
-        let cache_file = match std::fs::File::create(&temp_store_path) {
-            Ok(cache_file) => Ok(cache_file),
-            Err(e) => Err(CacheFileIoError {
-                src: format!("{}", e),
+        let temp_cache_file = match std::fs::File::create(&temp_store_path) {
+            Ok(temp_cache_file) => Ok(temp_cache_file),
+            Err(e) => Err(CacheFileIo {
+                src: e,
                 path: self.cache_path.to_path_buf(),
             }),
         }?;
 
-        let mut cache_buf = BufWriter::new(cache_file);
+        let mut cache_buf = BufWriter::new(temp_cache_file);
 
         let readable_cache = match self.cache.read() {
             Ok(cache) => cache,
@@ -102,16 +104,33 @@ where
         };
 
         if let Err(e) = bincode::serialize_into(&mut cache_buf, &*readable_cache) {
-            return Err(SerializationError {
+            return Err(Serialization {
                 src: format!("{}", e),
                 path: self.cache_path.to_path_buf(),
             });
+        }
+
+        let temp_cache_file = match cache_buf.into_inner() {
+            Err(e) => {
+                return Err(CacheFileIo {
+                    src: e.into_error(),
+                    path: self.cache_path.to_path_buf(),
+                })
+            }
+            Ok(x) => x,
         };
+
+        if let Err(e) = temp_cache_file.sync_all() {
+            return Err(CacheFileIo {
+                src: e,
+                path: self.cache_path.to_path_buf(),
+            });
+        }
 
         //now move the store to replace the old one.
         if let Err(e) = std::fs::rename(temp_store_path, &self.cache_path) {
-            return Err(CacheFileIoError {
-                src: format!("{}", e),
+            return Err(CacheFileIo {
+                src: e,
                 path: self.cache_path.to_path_buf(),
             });
         }
@@ -124,25 +143,25 @@ where
         //It just means that no cached values can be used. If so then go ahead and return early
         //as there is no deserialization to do.
         if !&self.cache_path.exists() {
-            info!(target: "cache_changes",
-                "No existing cache file found at {}.", self.cache_path.display()
+            info!(target: "generic_cache_startup",
+                "Creating new cache file: {}.", self.cache_path.display()
             );
             self.cache = Default::default();
             self.loaded_from_disk = true;
             return Ok(());
         }
 
-        let f = match std::fs::File::open(&self.cache_path) {
+        let cache_file = match std::fs::File::open(&self.cache_path) {
             Ok(f) => f,
             Err(e) => {
-                return Err(CacheFileIoError {
-                    src: format!("{}", e),
+                return Err(CacheFileIo {
+                    src: e,
                     path: self.cache_path.clone(),
                 })
             }
         };
 
-        let reader = std::io::BufReader::new(f);
+        let reader = std::io::BufReader::new(cache_file);
         let decode_result = bincode::deserialize_from(reader);
 
         //we may fail to read the hash file. This most likely to occur in development if <T> is changed.
@@ -150,9 +169,13 @@ where
             Ok(cache_file_data) => {
                 self.cache = cache_file_data;
                 self.loaded_from_disk = true;
+
+                trace!(target: "generic_cache_startup",
+                    "Loaded cache. Path: {}, Entries: {}", self.cache_path.display(), self.len()
+                );
                 Ok(())
             }
-            Err(e) => Err(DeserializationError {
+            Err(e) => Err(Deserialization {
                 src: format!("{}", e),
                 path: self.cache_path.to_path_buf(),
             }),
@@ -166,7 +189,7 @@ where
     pub fn insert(&self, key: PathBuf, item: T) -> FsCacheResult<()> {
         let cache_modified_count = self.cache_modified_count.fetch_add(1, Relaxed);
 
-        info!(target: "cache_changes",
+        info!(target: "generic_cache_insert",
             "inserting : {}",
             key.display()
         );
@@ -181,14 +204,14 @@ where
         self.update_transaction_count_and_save_if_necessary(cache_modified_count)
     }
 
-    pub fn remove(&self, key: impl Borrow<PathBuf>) -> FsCacheResult<()> {
+    pub fn remove(&self, key: impl AsRef<Path>) -> FsCacheResult<()> {
         {
-            //info!(target: "cache_changes", "Removing from cache: {}", key.borrow().display());
+            info!(target: "generic_cache_remove", "Removing: {}", key.as_ref().display());
             let mut writeable_cache = match self.cache.write() {
                 Ok(cache) => cache,
                 Err(_) => unreachable!(),
             };
-            writeable_cache.remove(key.borrow());
+            writeable_cache.remove(key.as_ref());
         }
         let cache_modified_count = self.cache_modified_count.fetch_add(1, Relaxed);
         self.update_transaction_count_and_save_if_necessary(cache_modified_count)
@@ -212,22 +235,20 @@ where
         }
     }
 
-    pub fn get(&self, key: impl Borrow<PathBuf>) -> Result<T, FsCacheErrorKind> {
+    pub fn fetch(&self, key: &Path) -> Result<T, FsCacheErrorKind> {
         match self.cache.read() {
             Err(_) => unreachable!(),
-            Ok(readable_cache) => match readable_cache.get(key.borrow()) {
+            Ok(readable_cache) => match readable_cache.get(key) {
                 Some(value) => Ok(value.clone()),
-                None => Err(FsCacheErrorKind::KeyMissingError(
-                    key.borrow().to_path_buf(),
-                )),
+                None => Err(FsCacheErrorKind::KeyMissing(key.to_path_buf())),
             },
         }
     }
 
-    pub fn contains_key(&self, key: impl Borrow<PathBuf>) -> bool {
+    pub fn contains_key(&self, key: &Path) -> bool {
         match self.cache.read() {
             Err(_) => unreachable!(),
-            Ok(cache) => cache.contains_key(key.borrow()),
+            Ok(cache) => cache.contains_key(key),
         }
     }
 
@@ -241,12 +262,17 @@ where
         .collect()
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         match self.cache.read() {
-            Ok(cache) => cache,
+            Ok(cache) => cache.len(),
             Err(_) => unreachable!(),
         }
-        .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self.cache.read() {
+            Ok(cache) => cache.is_empty(),
+            Err(_) => unreachable!(),
+        }
     }
 }
